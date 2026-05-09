@@ -5,6 +5,8 @@ Soporte multiformato (PDF, CSV, Excel, TXT) + OCR para PDF escaneados
 """
 
 import streamlit as st
+import sqlite3, json
+from datetime import datetime
 import re, io, warnings, os, tempfile, logging
 from pathlib import Path
 import pandas as pd
@@ -29,6 +31,122 @@ pd.set_option('display.max_colwidth', 90)
 pd.set_option('display.max_rows', 800)
 
 st.set_page_config(page_title="Conciliación CREDIEXPRESS", page_icon="🏦", layout="wide")
+# ══════════════════════════════════════════════════════════════════════════════
+# MÓDULO DE ALMACENAMIENTO — SQLite (offline) / Google Sheets (cloud)
+# ══════════════════════════════════════════════════════════════════════════════
+
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+OFFLINE_MODE = not os.path.exists("/mount/src")   # True=local, False=Streamlit Cloud
+DB_PATH      = os.path.join(BASE_DIR, "conciliaciones.db")
+
+# ── SQLite ────────────────────────────────────────────────────────────────────
+def _init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS historial (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        fecha_hora       TEXT,
+        archivo_banco    TEXT,
+        archivo_auxiliar TEXT,
+        periodo          TEXT,
+        n_banco          INTEGER,
+        n_aux            INTEGER,
+        n_exactas        INTEGER,
+        n_aprox          INTEGER,
+        n_solo_banco     INTEGER,
+        n_solo_aux       INTEGER,
+        tasa             REAL,
+        saldo_banco      REAL,
+        saldo_aux        REAL,
+        diferencia_neta  REAL,
+        excel_path       TEXT
+    )""")
+    conn.commit()
+    return conn
+
+def _auto_guardar_archivo(uploaded_file, subfolder="datos_entrada"):
+    if not OFFLINE_MODE or uploaded_file is None:
+        return None, False
+    dest_dir = os.path.join(BASE_DIR, subfolder, datetime.now().strftime("%Y-%m"))
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, uploaded_file.name)
+    if not os.path.exists(dest):
+        with open(dest, "wb") as f:
+            f.write(uploaded_file.getvalue())
+        return dest, True
+    return dest, False
+
+def _auto_guardar_excel(excel_bytes, nombre):
+    if not OFFLINE_MODE:
+        return None
+    ts      = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    destdir = os.path.join(BASE_DIR, "reportes_excel", ts)
+    os.makedirs(destdir, exist_ok=True)
+    dest = os.path.join(destdir, nombre)
+    with open(dest, "wb") as f:
+        f.write(excel_bytes)
+    return dest
+
+def _guardar_historial_sqlite(d):
+    try:
+        conn = _init_db()
+        conn.execute("""INSERT INTO historial
+            (fecha_hora,archivo_banco,archivo_auxiliar,periodo,
+             n_banco,n_aux,n_exactas,n_aprox,n_solo_banco,n_solo_aux,
+             tasa,saldo_banco,saldo_aux,diferencia_neta,excel_path)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (d["fecha_hora"],d["archivo_banco"],d["archivo_auxiliar"],d["periodo"],
+             d["n_banco"],d["n_aux"],d["n_exactas"],d["n_aprox"],
+             d["n_solo_banco"],d["n_solo_aux"],d["tasa"],
+             d["saldo_banco"],d["saldo_aux"],d["diferencia_neta"],d.get("excel_path","")))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+
+def _guardar_historial_sheets(d):
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_json = st.secrets.get("GOOGLE_SHEETS_CREDS", None)
+        sheet_id   = st.secrets.get("GOOGLE_SHEET_ID",    None)
+        if not creds_json or not sheet_id:
+            return
+        creds = Credentials.from_service_account_info(
+            json.loads(creds_json),
+            scopes=["https://spreadsheets.google.com/feeds",
+                    "https://www.googleapis.com/auth/drive"])
+        ws = gspread.authorize(creds).open_by_key(sheet_id).sheet1
+        if not ws.get_all_values():
+            ws.append_row(["Fecha","Banco","Auxiliar","Periodo",
+                           "Mov.Banco","Asientos","Exactas","Aprox",
+                           "Solo Banco","Solo Aux","Tasa %",
+                           "Saldo Banco","Saldo Aux","Diferencia Neta"])
+        ws.append_row([
+            d["fecha_hora"],d["archivo_banco"],d["archivo_auxiliar"],d["periodo"],
+            d["n_banco"],d["n_aux"],d["n_exactas"],d["n_aprox"],
+            d["n_solo_banco"],d["n_solo_aux"],round(d["tasa"],1),
+            round(d["saldo_banco"] or 0,2),round(d["saldo_aux"] or 0,2),
+            round(d["diferencia_neta"] or 0,2)])
+    except Exception:
+        pass
+
+def guardar_historial(d):
+    """Punto de entrada: SQLite si es offline, Google Sheets si es cloud."""
+    if OFFLINE_MODE:
+        _guardar_historial_sqlite(d)
+    else:
+        _guardar_historial_sheets(d)
+
+def leer_historial_sqlite(limite=8):
+    try:
+        if not os.path.exists(DB_PATH): return []
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            """SELECT fecha_hora,archivo_banco,archivo_auxiliar,periodo,
+                      tasa,n_exactas,n_banco,diferencia_neta
+               FROM historial ORDER BY id DESC LIMIT ?""", (limite,)).fetchall()
+        conn.close(); return rows
+    except Exception: return []
+
 
 # ── Helpers originales ────────────────────────────────────────────────────────
 def cop(v):
@@ -1353,6 +1471,33 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("<div style='font-size:.72rem;opacity:.7;text-align:center;'>v2.0 · CREDIEXPRESS POPAYÁN SAS<br>Desarrollado con ❤️ en Python + Streamlit</div>", unsafe_allow_html=True)
+    # ── Auto-guardar archivos subidos (solo offline) ─────────────────────────
+    if OFFLINE_MODE:
+        for _uf, _sub in [(banco_file, "datos_entrada"), (aux_file, "datos_entrada")]:
+            if _uf:
+                _ruta, _nuevo = _auto_guardar_archivo(_uf, _sub)
+                if _nuevo and _ruta:
+                    st.caption(f"💾 Guardado: .../{_uf.name}")
+
+    # ── Panel historial (solo offline) ───────────────────────────────────────
+    if OFFLINE_MODE:
+        _hist = leer_historial_sqlite(6)
+        if _hist:
+            st.markdown("---")
+            st.markdown("#### 📜 Historial")
+            for _h in _hist:
+                _fh, _fb, _fa, _per, _tasa, _ex, _nb, _dif = _h
+                _ico = "🟢" if _tasa >= 90 else ("🟡" if _tasa >= 75 else "🔴")
+                _per_lbl = f" · {_per}" if _per else ""
+                st.markdown(f"""
+<div style='background:rgba(255,255,255,0.08);border-radius:6px;
+            padding:7px 10px;margin:3px 0;font-size:.74rem;line-height:1.5;'>
+  {_ico} <b>{_fh[:16]}</b>{_per_lbl}<br>
+  <span style='opacity:.65;'>{os.path.basename(_fb)[:26]}</span><br>
+  <span style='color:#42a5f5;font-weight:700;'>{_tasa:.0f}% conciliado
+    &nbsp;·&nbsp; {_ex}/{_nb} mov.</span>
+</div>""", unsafe_allow_html=True)
+
 
 if 'run' in st.session_state and st.session_state.run:
     with st.spinner("Procesando archivos..."):
@@ -1409,6 +1554,30 @@ if 'run' in st.session_state and st.session_state.run:
         df_solo_aux = pd.DataFrame()
         n_tot = n_exac = n_apr = n_sbco = n_saux = pct_conc = 0
         exactas = aprox = s_banco = pd.DataFrame()
+    # ── Guardar análisis en historial ────────────────────────────────────────
+    try:
+        _per_det = _extraer_periodo(banco_file.name) if banco_file else None
+        _per_str = (f"{_MESES_ES[_per_det[1]-1]} {_per_det[0]}" if _per_det else "")
+        guardar_historial({
+            "fecha_hora"      : datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "archivo_banco"   : banco_file.name if banco_file else "",
+            "archivo_auxiliar": aux_file.name   if aux_file   else "",
+            "periodo"         : _per_str,
+            "n_banco"         : len(df_banco),
+            "n_aux"           : len(df_aux),
+            "n_exactas"       : int(n_exac),
+            "n_aprox"         : int(n_apr),
+            "n_solo_banco"    : int(n_sbco),
+            "n_solo_aux"      : int(n_saux),
+            "tasa"            : float(pct_conc),
+            "saldo_banco"     : float(sac  or 0),
+            "saldo_aux"       : float(sf_a or 0),
+            "diferencia_neta" : float((sac or 0) - (sf_a or 0)),
+            "excel_path"      : "",
+        })
+    except Exception:
+        pass
+
 
     # ── Pestañas ──────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
@@ -2071,6 +2240,16 @@ if 'run' in st.session_state and st.session_state.run:
                 colorear_por_estado(ws1, 11)
 
         output.seek(0)
+        # ── Auto-guardar Excel localmente (solo offline) ─────────────────────
+        if OFFLINE_MODE:
+            _excel_local = _auto_guardar_excel(output.getvalue(), nombre_salida)
+            if _excel_local:
+                st.markdown(f"""
+<div class='callout-success' style='margin-bottom:10px;font-size:.85rem;'>
+  💾 Excel guardado automaticamente en:<br>
+  <code style='font-size:.78rem;word-break:break-all;'>{_excel_local}</code>
+</div>""", unsafe_allow_html=True)
+
 
         col_dl, col_info = st.columns([1, 2])
         with col_dl:
