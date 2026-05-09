@@ -1624,14 +1624,41 @@ if 'run' in st.session_state and st.session_state.run:
         if df_aux.empty:
             st.markdown("<div class='callout-warning'>⚠️ Sin datos del auxiliar para comparar.</div>", unsafe_allow_html=True)
         else:
-            with st.expander(f"✅ Coincidencias Exactas — {len(exactas)} movimientos · {cop(exactas['VALOR_BANCO'].sum() if not exactas.empty else 0)}", expanded=False):
+            # ── Calcular desglose abonos / cargos para exactas ───────────────
+            if not exactas.empty:
+                _ex_ab = exactas[exactas['VALOR_BANCO'] > 0]
+                _ex_ca = exactas[exactas['VALOR_BANCO'] < 0]
+                _ex_bruto = exactas['VALOR_BANCO'].abs().sum()
+                _ex_titulo = (f"✅ Coincidencias Exactas — {len(exactas)} mov. "
+                              f"· Bruto: ${_ex_bruto:,.0f} COP")
+            else:
+                _ex_titulo = "✅ Coincidencias Exactas — 0 movimientos"
+                _ex_ab = _ex_ca = pd.DataFrame()
+                _ex_bruto = 0
+
+            with st.expander(_ex_titulo, expanded=False):
                 if exactas.empty:
                     st.markdown("<div class='callout-warning'>Sin coincidencias exactas.</div>", unsafe_allow_html=True)
                 else:
                     st.markdown(f"""
                     <div class='callout-success'>
-                      <b>{len(exactas)} movimientos conciliados exactamente</b> por valor y tipo de transacción.<br>
-                      Valor total conciliado: <b>{cop(exactas['VALOR_BANCO'].sum())}</b>
+                      <b>{len(exactas)} movimientos conciliados exactamente</b>
+                      por valor y tipo de transacción.<br><br>
+                      &nbsp;&nbsp;
+                      <span class='badge-verde'>Abonos (+)</span>
+                      &nbsp; {len(_ex_ab)} transacciones &nbsp;·&nbsp;
+                      Total: <b>${_ex_ab['VALOR_BANCO'].sum():,.0f}</b><br>
+                      &nbsp;&nbsp;
+                      <span class='badge-rojo'>Cargos (−)</span>
+                      &nbsp; {len(_ex_ca)} transacciones &nbsp;·&nbsp;
+                      Total: <b>${abs(_ex_ca['VALOR_BANCO'].sum()):,.0f}</b><br><br>
+                      Valor bruto total movido: <b>${_ex_bruto:,.0f} COP</b><br>
+                      <small style='opacity:.7;'>
+                        El valor bruto es la suma de valores absolutos (abonos + cargos).
+                        El neto algebraico (abonos − cargos) es
+                        ${exactas['VALOR_BANCO'].sum():,.0f} —
+                        es normal que sea negativo si los cargos superan los abonos en el período.
+                      </small>
                     </div>""", unsafe_allow_html=True)
                     cols_e = [c for c in ['FECHA_BANCO','TIPO_MOV','VALOR_BANCO','DOC_AUXILIAR','MONTO_AUXILIAR'] if c in exactas.columns]
                     st.dataframe(exactas[cols_e].head(100), use_container_width=True)
@@ -1652,8 +1679,8 @@ if 'run' in st.session_state and st.session_state.run:
 
             # ── SECCIÓN CRÍTICA: Movimientos sin registro contable ──────────
             n_sb = len(s_banco)
-            tot_sb = s_banco['VALOR_BANCO'].sum() if not s_banco.empty else 0
-            with st.expander(f"❌ Movimientos Bancarios SIN Registro Contable — {n_sb} trans. · {_cop_limpio(tot_sb)}", expanded=(n_sb > 0)):
+            bruto_sb = s_banco['VALOR_BANCO'].abs().sum() if not s_banco.empty else 0
+            with st.expander(f"❌ Movimientos Bancarios SIN Registro Contable — {n_sb} trans. · Bruto: ${bruto_sb:,.0f} COP", expanded=(n_sb > 0)):
                 if s_banco.empty:
                     st.markdown("<div class='callout-success'>✅ Todos los movimientos tienen asiento contable.</div>", unsafe_allow_html=True)
                 else:
