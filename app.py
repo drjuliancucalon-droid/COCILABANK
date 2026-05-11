@@ -1611,6 +1611,36 @@ def comparar_documentos(df_b, df_a):
     df_a['_PREFIJO'] = df_a['DOCUMENTO'].apply(_prefijo_doc)
     df_a['_NUMERICO'] = df_a['DOCUMENTO'].apply(_num_doc)
 
+    # ── Fase D: precargar catálogo NC UNA sola vez (evita 72k conexiones SQLite) ──
+    _catalogo_nc_cache = []
+    try:
+        if os.path.exists(DB_PATH):
+            _conn_cat = sqlite3.connect(DB_PATH)
+            _catalogo_nc_cache = _conn_cat.execute(
+                "SELECT banco_tokens, aux_tokens FROM nc_catalogo "
+                "WHERE nivel IN ('ALTA','MEDIA') ORDER BY confirmaciones DESC LIMIT 200"
+            ).fetchall()
+            _conn_cat.close()
+    except Exception:
+        _catalogo_nc_cache = []
+
+    def _cat_sim_memoria(banco_desc, aux_concepto):
+        """Similitud contra catálogo NC usando datos ya cargados en memoria."""
+        if not _catalogo_nc_cache:
+            return 0.0
+        bt = _extraer_tokens_nc(banco_desc)
+        at = _extraer_tokens_nc(aux_concepto)
+        mejor = 0.0
+        for bt_j, at_j in _catalogo_nc_cache:
+            try:
+                sim = (_similitud_tokens_nc(bt, json.loads(bt_j or '[]')) +
+                       _similitud_tokens_nc(at, json.loads(at_j or '[]'))) / 2
+                if sim > mejor:
+                    mejor = sim
+            except Exception:
+                pass
+        return mejor
+
     idx_usados = set()
     filas = []
 
@@ -1665,13 +1695,13 @@ def comparar_documentos(df_b, df_a):
                 lambda c: _score_concepto(desc_banco, c)
             )
 
-            # ── Fase D: bonus catalogo NC aprendido ───────────────────────────
-            def _cat_bonus(row):
-                if row.get('_PREFIJO','') != 'NC':
-                    return 0.0
-                _, sim = buscar_en_catalogo_nc(desc_banco, str(row.get('CONCEPTO','')))
-                return sim
-            candidatos['_cat_sim'] = candidatos.apply(_cat_bonus, axis=1)
+            # ── Fase D: bonus catálogo NC (en memoria, sin SQLite por fila) ──────
+            candidatos['_cat_sim'] = candidatos.apply(
+                lambda row: (
+                    _cat_sim_memoria(desc_banco, str(row.get('CONCEPTO', '') or ''))
+                    if row.get('_PREFIJO', '') == 'NC' else 0.0
+                ), axis=1
+            )
 
             # ── Score combinado ───────────────────────────────────────────────
             exactos = candidatos[candidatos['_diff'] <= TOL_EXACTA].copy()
