@@ -60,6 +60,18 @@ def _init_db():
         diferencia_neta  REAL,
         excel_path       TEXT
     )""")
+    # ── Fase C: catálogo de formatos PDF aprendidos ────────────────────────
+    conn.execute("""CREATE TABLE IF NOT EXISTS pdf_formatos (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        firma           TEXT UNIQUE,
+        tipo_doc        TEXT,
+        columnas        TEXT,
+        fmt_fecha       TEXT,
+        prefijos_doc    TEXT,
+        banco_detectado TEXT,
+        usos            INTEGER DEFAULT 1,
+        ultima_vez      TEXT
+    )""")
     conn.commit()
     return conn
 
@@ -146,6 +158,80 @@ def leer_historial_sqlite(limite=8):
                FROM historial ORDER BY id DESC LIMIT ?""", (limite,)).fetchall()
         conn.close(); return rows
     except Exception: return []
+
+# ── Fase C: Catálogo de formatos PDF aprendidos ───────────────────────────────
+def _firma_pdf(nombre_archivo, n_columnas):
+    """Genera una firma única por nombre normalizado + nro. columnas."""
+    base = re.sub(r'[0-9_\-]', '', os.path.splitext(nombre_archivo or '')[0].lower()).strip()
+    return f"{base}_{n_columnas}"
+
+def registrar_formato_pdf(nombre_archivo, tipo_doc, columnas, fmt_fecha,
+                          prefijos_doc, banco_detectado=""):
+    """Guarda o actualiza el patrón de un PDF procesado exitosamente."""
+    if not OFFLINE_MODE:
+        return
+    try:
+        firma = _firma_pdf(nombre_archivo, len(columnas) if columnas else 0)
+        ahora = datetime.now().isoformat(timespec='seconds')
+        conn  = _init_db()
+        existe = conn.execute(
+            "SELECT id, usos FROM pdf_formatos WHERE firma=?", (firma,)).fetchone()
+        if existe:
+            conn.execute(
+                "UPDATE pdf_formatos SET usos=?, ultima_vez=? WHERE firma=?",
+                (existe[1] + 1, ahora, firma))
+        else:
+            conn.execute("""INSERT INTO pdf_formatos
+                (firma, tipo_doc, columnas, fmt_fecha, prefijos_doc,
+                 banco_detectado, usos, ultima_vez)
+                VALUES (?,?,?,?,?,?,1,?)""",
+                (firma, tipo_doc,
+                 json.dumps(columnas or [], ensure_ascii=False),
+                 fmt_fecha or '',
+                 json.dumps(prefijos_doc or [], ensure_ascii=False),
+                 banco_detectado or '', ahora))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+
+def buscar_formato_pdf(nombre_archivo, n_columnas):
+    """Devuelve dict con info del formato guardado, o None si no existe."""
+    if not OFFLINE_MODE:
+        return None
+    try:
+        firma = _firma_pdf(nombre_archivo, n_columnas)
+        conn  = _init_db()
+        row   = conn.execute(
+            """SELECT tipo_doc, columnas, fmt_fecha, prefijos_doc,
+                      banco_detectado, usos, ultima_vez
+               FROM pdf_formatos WHERE firma=?""", (firma,)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            'tipo_doc'        : row[0],
+            'columnas'        : json.loads(row[1] or '[]'),
+            'fmt_fecha'       : row[2],
+            'prefijos_doc'    : json.loads(row[3] or '[]'),
+            'banco_detectado' : row[4],
+            'usos'            : row[5],
+            'ultima_vez'      : row[6],
+        }
+    except Exception:
+        return None
+
+def listar_formatos_aprendidos():
+    """Devuelve todos los formatos guardados en el catálogo."""
+    try:
+        if not os.path.exists(DB_PATH): return []
+        conn = _init_db()
+        rows = conn.execute(
+            """SELECT firma, tipo_doc, banco_detectado, usos, ultima_vez
+               FROM pdf_formatos ORDER BY usos DESC""").fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
 
 
 # ── Helpers originales ────────────────────────────────────────────────────────
@@ -522,6 +608,16 @@ def parsear_auxiliar_pdf(ruta, usar_ocr=False):
         meta['TOTAL_DEBITOS'] = df['DEBITO'].sum() if not df.empty else 0
     if not meta['TOTAL_CREDITOS']:
         meta['TOTAL_CREDITOS'] = df['CREDITO'].sum() if not df.empty else 0
+    # ── Fase C: aprender formato si el auxiliar fue parseado correctamente ──
+    if not df.empty:
+        prefijos_vistos = sorted(df['DOCUMENTO'].apply(_prefijo_doc).unique().tolist())                           if 'DOCUMENTO' in df.columns else []
+        registrar_formato_pdf(
+            nombre_archivo = meta.get('_nombre_archivo', ''),
+            tipo_doc       = 'auxiliar',
+            columnas       = list(df.columns),
+            fmt_fecha      = 'DD/MM/YYYY',
+            prefijos_doc   = [p for p in prefijos_vistos if p],
+        )
     return df, meta
 
 # ── Parseo para CSV/Excel/TXT ─────────────────────────────────────────────
@@ -1018,49 +1114,190 @@ def cargar_y_parsear(uploaded_file, tipo, usar_ocr=False):
         os.unlink(ruta)
     return df, res, legibilidad
 
-# ── Comparación (original) ─────────────────────────────────────────────────
+# ── Comparación inteligente (Fases A + B) ─────────────────────────────────
 TOL_EXACTA = 1.0
 TOL_APROX  = 0.005
 
+# ── Fase A: clasificador de prefijo de documento auxiliar ─────────────────
+_PAT_PREFIJO = re.compile(r'^([A-Z]{2,3})-', re.I)
+
+def _prefijo_doc(doc_str):
+    """Extrae prefijo: CE / CG / NC / CON / desconocido."""
+    m = _PAT_PREFIJO.match(str(doc_str or ''))
+    return m.group(1).upper() if m else ''
+
+def _score_concepto(desc_banco, concepto_aux):
+    """
+    Similitud rápida entre descripción bancaria y concepto auxiliar.
+    Devuelve 0.0–1.0 basado en palabras comunes (sin stopwords).
+    """
+    STOP = {'de','la','el','en','a','y','con','por','para','del','un','una',
+            'los','las','al','se','su','que','no','es','pago','transferencia'}
+    def _tokens(s):
+        return {w.lower() for w in re.findall(r'[a-z0-9]{3,}', (s or '').lower())
+                if w.lower() not in STOP}
+    t1 = _tokens(desc_banco)
+    t2 = _tokens(concepto_aux)
+    if not t1 or not t2:
+        return 0.0
+    return len(t1 & t2) / max(len(t1), len(t2))
+
+# ── Fase B: extractor de número de documento ─────────────────────────────
+_PAT_NUMERICO = re.compile(r'[A-Z]{2,3}-(\d+)', re.I)
+
+def _num_doc(doc_str):
+    """Extrae la parte numérica de CE-250201 → '250201'."""
+    m = _PAT_NUMERICO.match(str(doc_str or ''))
+    return m.group(1) if m else ''
+
 def comparar_documentos(df_b, df_a):
+    """
+    Reconciliación con matching inteligente por tipo de documento.
+
+    Fase A — Restricción por prefijo:
+        Movimiento ABONO  (vb > 0) → solo candidatos CG- / CON- (débitos)
+        Movimiento CARGO  (vb < 0) → solo candidatos CE- / NC-   (créditos)
+        Sin prefijo conocido        → candidatos libres de ambas columnas
+
+    Fase B — Bonus por número de documento:
+        Si el número del doc auxiliar (250201 de CE-250201) aparece
+        en la descripción bancaria → ese candidato sube en prioridad.
+
+    Dentro de los candidatos filtrados:
+        1) Match exacto por monto + bonus de doc-num / similitud de concepto
+        2) Match aproximado (±0.5 %) como fallback
+        3) Sin match → '❌ SOLO EN BANCO'
+    """
     if df_b.empty or df_a.empty:
         return pd.DataFrame(), df_a.copy() if not df_a.empty else pd.DataFrame()
+
+    # Pre-computar prefijo numérico en el auxiliar (Fase B)
+    df_a = df_a.copy()
+    df_a['_PREFIJO'] = df_a['DOCUMENTO'].apply(_prefijo_doc)
+    df_a['_NUMERICO'] = df_a['DOCUMENTO'].apply(_num_doc)
+
     idx_usados = set()
     filas = []
+
     for idx_b, row_b in df_b.iterrows():
         vb = row_b['VALOR']
-        if pd.isna(vb): continue
-        monto_abs = abs(vb)
-        col_buscar = 'DEBITO' if vb >= 0 else 'CREDITO'
-        libres = df_a[df_a.index.map(lambda i: i not in idx_usados) & df_a[col_buscar].notna()].copy()
+        if pd.isna(vb):
+            continue
+
+        monto_abs  = abs(vb)
+        desc_banco = str(row_b.get('DESCRIPCION', '') or '')
+
+        # ── Fase A: determinar candidatos por tipo de movimiento ──────────
+        es_abono = vb >= 0   # abono bancario → corresponde a CG- (débito contable)
+        es_cargo = vb < 0    # cargo bancario  → corresponde a CE- / NC- (crédito contable)
+
+        libres_todos = df_a[~df_a.index.isin(idx_usados)].copy()
+
+        if es_abono:
+            # CG- y CON- van en columna DÉBITO → abonos en cuenta
+            col_buscar  = 'DEBITO'
+            candidatos  = libres_todos[
+                libres_todos['_PREFIJO'].isin(['CG', 'CON']) &
+                libres_todos[col_buscar].notna()
+            ].copy()
+            if candidatos.empty:
+                # fallback: cualquier registro con DEBITO si no hay CG/CON
+                candidatos = libres_todos[libres_todos[col_buscar].notna()].copy()
+        else:
+            # CE- y NC- van en columna CRÉDITO → cargos / egresos
+            col_buscar  = 'CREDITO'
+            candidatos  = libres_todos[
+                libres_todos['_PREFIJO'].isin(['CE', 'NC']) &
+                libres_todos[col_buscar].notna()
+            ].copy()
+            if candidatos.empty:
+                candidatos = libres_todos[libres_todos[col_buscar].notna()].copy()
+
         match_tipo = match_monto = match_idx = None
         match_doc = match_conc = match_fecha_aux = ''
-        if not libres.empty:
-            libres['_diff'] = (libres[col_buscar] - monto_abs).abs()
-            exactos = libres[libres['_diff'] <= TOL_EXACTA]
+        match_metodo = ''
+
+        if not candidatos.empty:
+            candidatos['_diff'] = (candidatos[col_buscar] - monto_abs).abs()
+
+            # ── Fase B: bonus si el número de doc aparece en descripción bancaria ──
+            candidatos['_doc_bonus'] = candidatos['_NUMERICO'].apply(
+                lambda n: 1 if (n and n in desc_banco) else 0
+            )
+
+            # ── Similitud de concepto como desempate ─────────────────────────
+            candidatos['_sim'] = candidatos['CONCEPTO'].apply(
+                lambda c: _score_concepto(desc_banco, c)
+            )
+
+            # ── Score combinado (menor diff → mejor; más bonus/sim → mejor) ──
+            # Primero intentar match exacto por monto
+            exactos = candidatos[candidatos['_diff'] <= TOL_EXACTA].copy()
             if not exactos.empty:
-                mejor = exactos.nsmallest(1, '_diff').iloc[0]
-                match_tipo = 'EXACTO'; match_monto = mejor[col_buscar]; match_idx = mejor.name
-                match_doc = mejor['DOCUMENTO']; match_conc = mejor['CONCEPTO']; match_fecha_aux = mejor['FECHA_RAW']
+                # Ordenar: primero los con doc_bonus, luego por similitud, luego por diff
+                exactos = exactos.sort_values(
+                    ['_doc_bonus', '_sim', '_diff'],
+                    ascending=[False, False, True]
+                )
+                mejor = exactos.iloc[0]
+                match_tipo    = 'EXACTO'
+                match_metodo  = 'DOC+MONTO' if mejor['_doc_bonus'] else 'MONTO'
+                match_monto   = mejor[col_buscar]
+                match_idx     = mejor.name
+                match_doc     = mejor['DOCUMENTO']
+                match_conc    = mejor['CONCEPTO']
+                match_fecha_aux = mejor['FECHA_RAW']
+
+            # ── Fallback: match aproximado ───────────────────────────────────
             if match_tipo is None and monto_abs > 0:
-                aprox = libres[libres['_diff'] / monto_abs <= TOL_APROX]
+                aprox = candidatos[
+                    (candidatos['_diff'] / monto_abs) <= TOL_APROX
+                ].copy()
                 if not aprox.empty:
-                    mejor = aprox.nsmallest(1, '_diff').iloc[0]
-                    match_tipo = 'APROX'; match_monto = mejor[col_buscar]; match_idx = mejor.name
-                    match_doc = mejor['DOCUMENTO']; match_conc = mejor['CONCEPTO']; match_fecha_aux = mejor['FECHA_RAW']
-        if match_idx is not None: idx_usados.add(match_idx)
-        estado = '✅ COINCIDE EXACTO' if match_tipo=='EXACTO' else '🔶 COINCIDE APROX.' if match_tipo=='APROX' else '❌ SOLO EN BANCO'
+                    aprox = aprox.sort_values(
+                        ['_doc_bonus', '_sim', '_diff'],
+                        ascending=[False, False, True]
+                    )
+                    mejor = aprox.iloc[0]
+                    match_tipo    = 'APROX'
+                    match_metodo  = 'DOC+APROX' if mejor['_doc_bonus'] else 'APROX'
+                    match_monto   = mejor[col_buscar]
+                    match_idx     = mejor.name
+                    match_doc     = mejor['DOCUMENTO']
+                    match_conc    = mejor['CONCEPTO']
+                    match_fecha_aux = mejor['FECHA_RAW']
+
+        if match_idx is not None:
+            idx_usados.add(match_idx)
+
+        estado   = ('✅ COINCIDE EXACTO' if match_tipo == 'EXACTO'
+                    else '🔶 COINCIDE APROX.' if match_tipo == 'APROX'
+                    else '❌ SOLO EN BANCO')
         diff_val = abs(monto_abs - match_monto) if match_monto is not None else None
+
         filas.append({
-            'N': idx_b, 'FECHA_BANCO': row_b['FECHA_RAW'], 'TIPO_MOV': row_b['TIPO'],
-            'DESCRIPCION': row_b['DESCRIPCION'], 'VALOR_BANCO': vb,
-            'DOC_AUXILIAR': match_doc, 'FECHA_AUXILIAR': match_fecha_aux,
-            'CONCEPTO_AUX': match_conc, 'MONTO_AUXILIAR': match_monto,
-            'DIFERENCIA': diff_val, 'ESTADO': estado, 'MATCH_TIPO': match_tipo or 'SIN_MATCH',
-            'PAGINA_PDF': row_b.get('PAGINA', ''),
+            'N'              : idx_b,
+            'FECHA_BANCO'    : row_b['FECHA_RAW'],
+            'TIPO_MOV'       : row_b['TIPO'],
+            'DESCRIPCION'    : desc_banco,
+            'VALOR_BANCO'    : vb,
+            'DOC_AUXILIAR'   : match_doc,
+            'FECHA_AUXILIAR' : match_fecha_aux,
+            'CONCEPTO_AUX'   : match_conc,
+            'MONTO_AUXILIAR' : match_monto,
+            'DIFERENCIA'     : diff_val,
+            'ESTADO'         : estado,
+            'MATCH_TIPO'     : match_tipo or 'SIN_MATCH',
+            'METODO_MATCH'   : match_metodo,
+            'PAGINA_PDF'     : row_b.get('PAGINA', ''),
         })
+
     df_comp = pd.DataFrame(filas)
     df_solo_aux = df_a[~df_a.index.isin(idx_usados)].copy()
+    # Limpiar columnas internas del auxiliar
+    for _c in ['_PREFIJO', '_NUMERICO']:
+        if _c in df_solo_aux.columns:
+            df_solo_aux.drop(columns=[_c], inplace=True)
     df_solo_aux['ESTADO'] = '📋 SOLO EN AUXILIAR'
     return df_comp, df_solo_aux
 
@@ -1481,6 +1718,19 @@ with st.sidebar:
 
     # ── Panel historial (solo offline) ───────────────────────────────────────
     if OFFLINE_MODE:
+        # ── Fase C: formatos aprendidos ──────────────────────────────────
+        _formatos = listar_formatos_aprendidos()
+        if _formatos:
+            st.markdown("---")
+            st.markdown("**🧠 Formatos Aprendidos**")
+            for _fma, _tipo, _banco, _usos, _ultima in _formatos[:5]:
+                _ico2 = "📄" if _tipo == "auxiliar" else "🏦"
+                st.markdown(
+                    f"<small>{_ico2} <b>{_fma}</b><br>"
+                    f"&nbsp;&nbsp;{_usos} uso{'s' if _usos!=1 else ''}"
+                    f" · {(_ultima or '')[:10]}</small>",
+                    unsafe_allow_html=True
+                )
         _hist = leer_historial_sqlite(6)
         if _hist:
             st.markdown("---")
