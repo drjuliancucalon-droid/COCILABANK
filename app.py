@@ -911,11 +911,26 @@ def _det_world_office_aux_csv(ruta, m):
     ]
     return sum(hits) / len(hits)
 
-def _det_aux_pdf_generico(ruta, m):
+def _det_siigo_aux_pdf(ruta, m):
+    """Detector especifico para exportaciones PDF de SIIGO Auxiliares de Plan de Cuentas."""
     hits = [
-        bool(re.search(r'(?:CON|CE|NC|RE|RG)-\d+',   m)),
-        bool(re.search(r'Saldo\s+Inicial',            m, re.I)),
-        bool(re.search(r'Subtotales',                 m, re.I)),
+        bool(re.search(r'(?:CON|CE|CG|NC|RE|RG)-\d+',    m)),         # codigos de documento
+        bool(re.search(r'D[e\xe9]bitos?',                  m, re.I)),   # columna Debitos
+        bool(re.search(r'Cr[e\xe9]ditos?',                 m, re.I)),   # columna Creditos
+        bool(re.search(r'Saldo\s+Inicial|Saldo\s+Final',  m, re.I)),   # saldos
+        bool(re.search(r'Auxiliares|Plan\s+de\s+Cuentas', m, re.I)),   # encabezado SIIGO
+        bool(re.search(r'\d{1,2}/\d{1,2}/\d{4}',         m)),         # formato fecha DD/MM/YYYY
+    ]
+    return sum(hits) / len(hits)
+
+def _det_aux_pdf_generico(ruta, m):
+    """Detector generico para cualquier auxiliar en PDF con prefijos de documento."""
+    hits = [
+        bool(re.search(r'(?:CON|CE|CG|NC|RE|RG)-\d+',    m)),
+        bool(re.search(r'D[e\xe9]bitos?',                  m, re.I)),
+        bool(re.search(r'Cr[e\xe9]ditos?',                 m, re.I)),
+        bool(re.search(r'Saldo',                           m, re.I)),
+        bool(re.search(r'\d{1,2}/\d{1,2}/\d{4}',         m)),
     ]
     return sum(hits) / len(hits)
 
@@ -1045,6 +1060,13 @@ REGISTRO_FORMATOS = [
         'ext'     : ['.csv', '.xlsx', '.xls'],
         'detectar': _det_world_office_aux_csv,
         'parsear' : _par_world_office_aux_csv,
+    },
+    {
+        'nombre'  : 'SIIGO — PDF Auxiliares Plan de Cuentas',
+        'tipo'    : 'AUXILIAR',
+        'ext'     : ['.pdf'],
+        'detectar': _det_siigo_aux_pdf,
+        'parsear' : _par_aux_pdf_generico,
     },
     {
         'nombre'  : 'Auxiliar Contable — PDF (CON/CE/NC)',
