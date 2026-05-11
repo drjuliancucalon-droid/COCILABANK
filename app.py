@@ -2761,8 +2761,8 @@ if 'run' in st.session_state and st.session_state.run:
             # ── SECCIÓN RECHAZOS / DEVOLUCIONES ──────────────────────────────
             _bruto_rec = rechazos['VALOR_BANCO'].abs().sum() if not rechazos.empty else 0
             with st.expander(
-                f"🔄 Rechazos / Devoluciones — CONFIRMAR — {n_rec} trans. · ${_bruto_rec:,.0f} COP",
-                expanded=(n_rec > 0)
+                f"🔄 Rechazos / Devoluciones — CONFIRMAR — {int(n_rec)} trans. · ${_bruto_rec:,.0f} COP",
+                expanded=bool(n_rec > 0)
             ):
                 if rechazos.empty:
                     st.markdown("<div class='callout-success'>✅ Sin cargos rechazados detectados este período.</div>", unsafe_allow_html=True)
@@ -2788,7 +2788,7 @@ if 'run' in st.session_state and st.session_state.run:
             # ── SECCIÓN CRÍTICA: Movimientos sin registro contable ──────────
             n_sb = len(s_banco)
             bruto_sb = s_banco['VALOR_BANCO'].abs().sum() if not s_banco.empty else 0
-            with st.expander(f"❌ Movimientos Bancarios SIN Registro Contable — {n_sb} trans. · Bruto: ${bruto_sb:,.0f} COP", expanded=(n_sb > 0)):
+            with st.expander(f"❌ Movimientos Bancarios SIN Registro Contable — {int(n_sb)} trans. · Bruto: ${bruto_sb:,.0f} COP", expanded=bool(n_sb > 0)):
                 if s_banco.empty:
                     st.markdown("<div class='callout-success'>✅ Todos los movimientos tienen asiento contable.</div>", unsafe_allow_html=True)
                 else:
@@ -2817,7 +2817,7 @@ if 'run' in st.session_state and st.session_state.run:
             n_sa = len(df_solo_aux)
             deb_sa = df_solo_aux['DEBITO'].sum()  if not df_solo_aux.empty else 0
             cre_sa = df_solo_aux['CREDITO'].sum() if not df_solo_aux.empty else 0
-            with st.expander(f"📋 Asientos Auxiliar SIN Transacción Bancaria — {n_sa} asientos", expanded=(n_sa > 0)):
+            with st.expander(f"📋 Asientos Auxiliar SIN Transacción Bancaria — {int(n_sa)} asientos", expanded=bool(n_sa > 0)):
                 if df_solo_aux.empty:
                     st.markdown("<div class='callout-success'>✅ Todos los asientos tienen transacción bancaria.</div>", unsafe_allow_html=True)
                 else:
