@@ -1923,6 +1923,13 @@ def comparar_documentos(df_b, df_a):
                 return '|'.join(w for w in words if w not in _skip)
 
             _sb_f['_gkey'] = _sb_f['DESCRIPCION'].apply(_clave_grupo)
+            # Subgrupo por monto: bucket de ±5% para separar montos distintos
+            # con la misma descripción (ej. 509.62 vs 2682.17 en DEBITO RECHAZOS)
+            _sb_f['_gkey_monto'] = _sb_f.apply(
+                lambda r: _clave_grupo(str(r.get('DESCRIPCION',''))) + '||' +
+                          str(round(abs(float(r.get('VALOR_BANCO', 0) or 0)) / 50) * 50),
+                axis=1
+            )
 
             _usados_f_b  = set()
             _usados_f_nc = set()
@@ -1942,18 +1949,23 @@ def comparar_documentos(df_b, df_a):
                 _mejor_grupo_idx  = None
                 _mejor_grupo_diff = None
 
-                for _gkey, _grp in _pendientes.groupby('_gkey'):
-                    if not _gkey:
-                        continue
-                    _suma = float(_grp['VALOR_BANCO'].abs().sum())
-                    if _suma < 1:
-                        continue
-                    _diff_pct = abs(_suma - _nc_val) / max(_nc_val, 1)
-                    if _diff_pct <= _TOL_GRUPO:
-                        # Preferir el grupo cuya suma sea más cercana
-                        if _mejor_grupo_diff is None or _diff_pct < _mejor_grupo_diff:
-                            _mejor_grupo_idx  = list(_grp.index)
-                            _mejor_grupo_diff = _diff_pct
+                # Primero intenta subgrupos por descripción+monto (más preciso)
+                # Luego intenta solo por descripción (más amplio)
+                for _gfield in ['_gkey_monto', '_gkey']:
+                    for _gkey, _grp in _pendientes.groupby(_gfield):
+                        if not _gkey:
+                            continue
+                        _suma = float(_grp['VALOR_BANCO'].abs().sum())
+                        if _suma < 1:
+                            continue
+                        _diff_pct = abs(_suma - _nc_val) / max(_nc_val, 1)
+                        if _diff_pct <= _TOL_GRUPO:
+                            # Preferir el grupo cuya suma sea más cercana
+                            if _mejor_grupo_diff is None or _diff_pct < _mejor_grupo_diff:
+                                _mejor_grupo_idx  = list(_grp.index)
+                                _mejor_grupo_diff = _diff_pct
+                    if _mejor_grupo_idx is not None:
+                        break  # encontró match con subgrupo más preciso
 
                 if _mejor_grupo_idx is None:
                     continue
