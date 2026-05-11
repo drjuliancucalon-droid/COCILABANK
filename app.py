@@ -1892,6 +1892,92 @@ def comparar_documentos(df_b, df_a):
         if _usados_fase_e:
             df_solo_aux = df_solo_aux.drop(index=list(_usados_fase_e), errors='ignore')
 
+    # ══════════════════════════════════════════════════════════════════════
+    # FASE F — N cargos bancarios → 1 NC (matching por agrupación)
+    # Cuando el banco cobra N veces el mismo tipo de cargo (ej: IVA por
+    # cada transacción) y el auxiliar tiene UNA sola NC por el total.
+    # Tolerancia ±1 % para cubrir redondeos del contador.
+    # ══════════════════════════════════════════════════════════════════════
+    _TOL_GRUPO = 0.01   # ±1 %
+
+    if not df_comp.empty and not df_solo_aux.empty:
+        # Cargos bancarios que siguen SOLO EN BANCO
+        _sb_f = df_comp[
+            (df_comp['ESTADO'] == '❌ SOLO EN BANCO') &
+            (df_comp['TIPO_MOV'] == 'CARGO')
+        ].copy()
+
+        # NC libres en el auxiliar
+        _nc_f = df_solo_aux[
+            df_solo_aux.get('DOCUMENTO', pd.Series(dtype=str))
+                        .str.startswith('NC-', na=False) &
+            df_solo_aux['CREDITO'].notna()
+        ].copy()
+
+        if not _sb_f.empty and not _nc_f.empty:
+            # Clave de agrupación: tokens significativos de la descripción
+            def _clave_grupo(s):
+                words = re.findall(r'[A-Z]{3,}', (s or '').upper())
+                # quitar palabras muy genéricas
+                _skip = {'CARG','CARGO','PAGO','PROV','BANC','COBR'}
+                return '|'.join(w for w in words if w not in _skip)
+
+            _sb_f['_gkey'] = _sb_f['DESCRIPCION'].apply(_clave_grupo)
+
+            _usados_f_b  = set()
+            _usados_f_nc = set()
+
+            # Para cada NC libre, buscar un grupo cuya suma coincida
+            for _nci, _ncrow in _nc_f.iterrows():
+                if _nci in _usados_f_nc:
+                    continue
+                _nc_val = float(_ncrow['CREDITO'])
+                if _nc_val < 1:
+                    continue
+
+                _pendientes = _sb_f[~_sb_f.index.isin(_usados_f_b)]
+                if _pendientes.empty:
+                    break
+
+                _mejor_grupo_idx  = None
+                _mejor_grupo_diff = None
+
+                for _gkey, _grp in _pendientes.groupby('_gkey'):
+                    if not _gkey:
+                        continue
+                    _suma = float(_grp['VALOR_BANCO'].abs().sum())
+                    if _suma < 1:
+                        continue
+                    _diff_pct = abs(_suma - _nc_val) / max(_nc_val, 1)
+                    if _diff_pct <= _TOL_GRUPO:
+                        # Preferir el grupo cuya suma sea más cercana
+                        if _mejor_grupo_diff is None or _diff_pct < _mejor_grupo_diff:
+                            _mejor_grupo_idx  = list(_grp.index)
+                            _mejor_grupo_diff = _diff_pct
+
+                if _mejor_grupo_idx is None:
+                    continue
+
+                _n = len(_mejor_grupo_idx)
+                _conf_f = max(55, int((1 - _mejor_grupo_diff) * 85))
+                for _bidx in _mejor_grupo_idx:
+                    df_comp.loc[_bidx, 'DOC_AUXILIAR']  = _ncrow.get('DOCUMENTO', '')
+                    df_comp.loc[_bidx, 'FECHA_AUXILIAR'] = _ncrow.get('FECHA_RAW', '')
+                    df_comp.loc[_bidx, 'CONCEPTO_AUX']  = _ncrow.get('CONCEPTO', '')
+                    df_comp.loc[_bidx, 'MONTO_AUXILIAR'] = round(_nc_val / _n, 2)
+                    df_comp.loc[_bidx, 'DIFERENCIA']    = round(
+                        abs(float(df_comp.loc[_bidx,'VALOR_BANCO']) + _nc_val/_n), 2)
+                    df_comp.loc[_bidx, 'ESTADO']        = f'🔵 AGRUPADO N:1 ({_n} cargos → 1 NC)'
+                    df_comp.loc[_bidx, 'MATCH_TIPO']    = 'AGRUPADO'
+                    df_comp.loc[_bidx, 'METODO_MATCH']  = f'FASE_F_N{_n}'
+                    df_comp.loc[_bidx, 'CONFIANZA']     = _conf_f
+                    _usados_f_b.add(_bidx)
+                _usados_f_nc.add(_nci)
+
+        # Quitar NC usadas en Fase F del auxiliar suelto
+        if not _sb_f.empty and '_usados_f_nc' in dir() and _usados_f_nc:
+            df_solo_aux = df_solo_aux.drop(index=list(_usados_f_nc), errors='ignore')
+
     return df_comp, df_solo_aux
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2429,8 +2515,9 @@ if 'run' in st.session_state and st.session_state.run:
     # Comparación
     if not df_aux.empty:
         df_comp, df_solo_aux = comparar_documentos(df_banco, df_aux)
-        n_tot  = len(df_comp)
+        n_tot    = len(df_comp)
         rechazos = df_comp[df_comp['ESTADO'] == '🔄 RECHAZO — CONFIRMAR']
+        agrupados = df_comp[df_comp['ESTADO'].str.startswith('🔵 AGRUPADO', na=False)]
         # ── Fase D3: auto-aprendizaje NC post-reconciliacion ─────────────────
         if not df_comp.empty and 'DOC_AUXILIAR' in df_comp.columns:
             _nc_matches = df_comp[
@@ -2448,6 +2535,7 @@ if 'run' in st.session_state and st.session_state.run:
         n_apr  = (df_comp['ESTADO'] == '🔶 COINCIDE APROX.').sum()
         n_sbco = (df_comp['ESTADO'] == '❌ SOLO EN BANCO').sum()
         n_rec  = (df_comp['ESTADO'] == '🔄 RECHAZO — CONFIRMAR').sum()
+        n_agr  = df_comp['ESTADO'].str.startswith('🔵 AGRUPADO', na=False).sum()
         n_saux = len(df_solo_aux)
         pct_conc = (n_exac + n_apr) / max(n_tot, 1) * 100
         exactas = df_comp[df_comp['ESTADO'] == '✅ COINCIDE EXACTO']
@@ -2456,8 +2544,8 @@ if 'run' in st.session_state and st.session_state.run:
     else:
         df_comp = pd.DataFrame()
         df_solo_aux = pd.DataFrame()
-        n_tot = n_exac = n_apr = n_sbco = n_saux = n_rec = pct_conc = 0
-        exactas = aprox = s_banco = rechazos = pd.DataFrame()
+        n_tot = n_exac = n_apr = n_sbco = n_saux = n_rec = n_agr = pct_conc = 0
+        exactas = aprox = s_banco = rechazos = agrupados = pd.DataFrame()
     # ── Guardar análisis en historial ────────────────────────────────────────
     try:
         _per_det = _extraer_periodo(banco_file.name) if banco_file else None
@@ -2672,13 +2760,14 @@ if 'run' in st.session_state and st.session_state.run:
         if df_aux.empty:
             st.markdown("<div class='callout-warning'>⚠️ Sin datos del auxiliar para comparar.</div>", unsafe_allow_html=True)
         else:
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
             c1.metric("Total Analizados", n_tot)
             c2.metric("✅ Exactos",    n_exac, f"{n_exac/max(n_tot,1)*100:.0f}%")
             c3.metric("🔶 Aprox.",     n_apr,  f"{n_apr/max(n_tot,1)*100:.0f}%")
-            c4.metric("🔄 Rechazos",   n_rec,  "Confirmar" if n_rec else "—")
-            c5.metric("❌ Solo Banco", n_sbco, f"{n_sbco/max(n_tot,1)*100:.0f}%")
-            c6.metric("📋 Solo Aux.",  n_saux)
+            c4.metric("🔵 Agrupados",  n_agr,  "N:1 NC" if n_agr else "—")
+            c5.metric("🔄 Rechazos",   n_rec,  "Confirmar" if n_rec else "—")
+            c6.metric("❌ Solo Banco", n_sbco, f"{n_sbco/max(n_tot,1)*100:.0f}%")
+            c7.metric("📋 Solo Aux.",  n_saux)
 
             ico, lbl, cls = _semaforo_conciliacion(pct_conc)
             st.progress(pct_conc / 100, text=f"{ico} Tasa de conciliación: {pct_conc:.1f}% — {lbl}")
@@ -2689,6 +2778,13 @@ if 'run' in st.session_state and st.session_state.run:
                else ("Entre 75% y 90% de los movimientos conciliados. Hay diferencias puntuales que requieren revisión." if pct_conc>=75
                else "Menos del 75% de los movimientos conciliados. Se requiere revisión detallada del auxiliar contable.")}
             </div>""", unsafe_allow_html=True)
+            if n_agr > 0:
+                st.markdown(f"""
+                <div class='callout-info'>
+                  <b>🔵 {int(n_agr)} cargo(s) bancarios agrupados y vinculados a 1 NC del auxiliar (N:1).</b><br>
+                  El banco los cobró individualmente; el contador los registró como una sola Nota Contable.
+                  Ver detalle en <b>📝 Diferencias</b> → sección <i>Agrupados N:1</i>.
+                </div>""", unsafe_allow_html=True)
             if n_rec > 0:
                 st.markdown(f"""
                 <div class='callout-warning'>
@@ -2757,6 +2853,45 @@ if 'run' in st.session_state and st.session_state.run:
                     </div>""", unsafe_allow_html=True)
                     cols_a = [c for c in ['FECHA_BANCO','TIPO_MOV','VALOR_BANCO','MONTO_AUXILIAR','DIFERENCIA','DOC_AUXILIAR'] if c in aprox.columns]
                     st.dataframe(aprox[cols_a], use_container_width=True)
+
+            # ── SECCIÓN AGRUPADOS N:1 ────────────────────────────────────────
+            _bruto_agr = agrupados['VALOR_BANCO'].abs().sum() if not agrupados.empty else 0
+            with st.expander(
+                f"🔵 Cargos Agrupados N:1 — {int(n_agr)} cargos bancarios → NC únicas · ${_bruto_agr:,.0f} COP",
+                expanded=bool(n_agr > 0)
+            ):
+                if agrupados.empty:
+                    st.markdown("<div class='callout-success'>✅ Sin cargos agrupados este período.</div>",
+                                unsafe_allow_html=True)
+                else:
+                    # Resumir por NC vinculada
+                    _agr_grupos = agrupados.groupby('DOC_AUXILIAR').agg(
+                        N_cargos=('VALOR_BANCO', 'count'),
+                        Suma_banco=('VALOR_BANCO', lambda x: x.abs().sum()),
+                        NC_concepto=('CONCEPTO_AUX', 'first'),
+                        Fecha_NC=('FECHA_AUXILIAR', 'first'),
+                    ).reset_index()
+                    st.markdown(f"""
+                    <div class='callout-info'>
+                      <b>🔵 {int(n_agr)} cargo(s) bancarios corresponden a {len(_agr_grupos)} NC del auxiliar.</b><br>
+                      El banco cobra individualmente (por cada transacción) y el contador registra
+                      una sola NC por el total. El sistema los vinculó automáticamente con tolerancia ±1%.<br><br>
+                      <b>¿Requieren acción?</b> No — ya están registrados como nota contable.
+                      Solo verifique que la NC del auxiliar esté correctamente fechada.
+                    </div>""", unsafe_allow_html=True)
+                    st.markdown("**Resumen por NC:**")
+                    st.dataframe(_agr_grupos.rename(columns={
+                        'DOC_AUXILIAR': 'NC Auxiliar',
+                        'N_cargos'    : 'N cargos banco',
+                        'Suma_banco'  : 'Total banco ($)',
+                        'NC_concepto' : 'Concepto NC',
+                        'Fecha_NC'    : 'Fecha NC',
+                    }), use_container_width=True)
+                    st.markdown("**Detalle de cargos individuales:**")
+                    _cols_agr = [c for c in ['FECHA_BANCO','DESCRIPCION','VALOR_BANCO',
+                                             'DOC_AUXILIAR','CONCEPTO_AUX','CONFIANZA','ESTADO']
+                                 if c in agrupados.columns]
+                    st.dataframe(agrupados[_cols_agr], use_container_width=True)
 
             # ── SECCIÓN RECHAZOS / DEVOLUCIONES ──────────────────────────────
             _bruto_rec = rechazos['VALOR_BANCO'].abs().sum() if not rechazos.empty else 0
@@ -3094,6 +3229,7 @@ if 'run' in st.session_state and st.session_state.run:
         FILL_ROJO     = PatternFill("solid", fgColor="F7C5C5")
         FILL_AZUL     = PatternFill("solid", fgColor="D0E8FF")
         FILL_NARANJA  = PatternFill("solid", fgColor="FFE0B2")   # rechazos pendientes
+        FILL_CELESTE  = PatternFill("solid", fgColor="B3E5FC")   # agrupados N:1
         FILL_HEADER   = PatternFill("solid", fgColor="1565C0")
         FONT_HEADER   = Font(bold=True, color="FFFFFF", size=10)
 
@@ -3111,6 +3247,7 @@ if 'run' in st.session_state and st.session_state.run:
                 val = str(row[col_estado_idx - 1].value or "")
                 fill = (FILL_VERDE    if "COINCIDE EXACTO" in val else
                         FILL_AMARILLO if "COINCIDE APROX"  in val else
+                        FILL_CELESTE  if "AGRUPADO"        in val else
                         FILL_NARANJA  if "RECHAZO"         in val else
                         FILL_ROJO     if "SOLO EN BANCO"   in val else
                         FILL_AZUL     if "SOLO EN AUXILIAR" in val else None)
@@ -3134,18 +3271,19 @@ if 'run' in st.session_state and st.session_state.run:
             for estado, nombre in [
                 ("COINCIDE EXACTO", "2_Coincidencias_Exactas"),
                 ("COINCIDE APROX.", "3_Coincidencias_Aprox"),
-                ("RECHAZO",        "4_Rechazos_Confirmar"),
-                ("SOLO EN BANCO",  "5_Solo_Banco_Sin_Auxiliar"),
+                ("AGRUPADO",       "4_Agrupados_N1"),
+                ("RECHAZO",        "5_Rechazos_Confirmar"),
+                ("SOLO EN BANCO",  "6_Solo_Banco_Sin_Auxiliar"),
             ]:
                 sub = df_comp[df_comp["ESTADO"].str.contains(estado, na=False)].copy() if not df_aux.empty else pd.DataFrame()
                 if sub.empty: sub = pd.DataFrame({"Info": ["Sin registros"]})
                 sub.to_excel(writer, sheet_name=nombre, index=False)
 
             if not df_solo_aux.empty:
-                df_solo_aux.to_excel(writer, sheet_name="6_Solo_Auxiliar_Sin_Banco", index=False)
+                df_solo_aux.to_excel(writer, sheet_name="7_Solo_Auxiliar_Sin_Banco", index=False)
             else:
                 pd.DataFrame({"Info": ["Todos los asientos tienen movimiento bancario"]}).to_excel(
-                    writer, sheet_name="6_Solo_Auxiliar_Sin_Banco", index=False)
+                    writer, sheet_name="7_Solo_Auxiliar_Sin_Banco", index=False)
 
             df_banco.to_excel(writer, sheet_name="7_Extracto_Banco_Completo", index=True)
             df_aux.to_excel(writer, sheet_name="8_Auxiliar_Contable_Completo", index=True)
@@ -3159,8 +3297,8 @@ if 'run' in st.session_state and st.session_state.run:
                     "Total debitos auxiliar", "Total creditos auxiliar",
                     "Diferencia saldos finales",
                     "Movimientos analizados", "Coincidencias exactas",
-                    "Coincidencias aprox.", "Rechazos confirmar",
-                    "Solo en banco", "Solo en auxiliar",
+                    "Coincidencias aprox.", "Agrupados N:1",
+                    "Rechazos confirmar", "Solo en banco", "Solo en auxiliar",
                     "Tasa de conciliacion %",
                 ],
                 "Valor": [
@@ -3168,7 +3306,7 @@ if 'run' in st.session_state and st.session_state.run:
                     sa, sac, tab_s, tca_s,
                     si_a, sf_a, td_a, tc_a,
                     sac - sf_a,
-                    n_tot, n_exac, n_apr, int(n_rec), n_sbco, n_saux,
+                    n_tot, n_exac, n_apr, int(n_agr), int(n_rec), n_sbco, n_saux,
                     round(pct_conc, 1),
                 ]
             }
