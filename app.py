@@ -72,6 +72,40 @@ def _init_db():
         usos            INTEGER DEFAULT 1,
         ultima_vez      TEXT
     )""")
+    # ── Fase D: catalogo de conceptos NC aprendidos ──────────────────────
+    conn.execute("""CREATE TABLE IF NOT EXISTS nc_catalogo (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        uuid            TEXT UNIQUE,
+        banco_tokens    TEXT,
+        aux_tokens      TEXT,
+        confirmaciones  INTEGER DEFAULT 1,
+        nivel           TEXT DEFAULT 'PENDIENTE',
+        aprobado_por    TEXT DEFAULT 'AUTO',
+        fecha_primera   TEXT,
+        fecha_ultima    TEXT,
+        sync_status     TEXT DEFAULT 'PENDIENTE_SYNC'
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS nc_aprendizaje (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        uuid            TEXT UNIQUE,
+        banco_desc_raw  TEXT,
+        aux_concepto_raw TEXT,
+        banco_tokens    TEXT,
+        aux_tokens      TEXT,
+        veces_visto     INTEGER DEFAULT 1,
+        fecha_primera   TEXT,
+        fecha_ultima    TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS nc_historial_match (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        fecha           TEXT,
+        banco_desc      TEXT,
+        aux_doc         TEXT,
+        aux_concepto    TEXT,
+        metodo          TEXT,
+        valor_banco     REAL,
+        valor_aux       REAL
+    )""")
     conn.commit()
     return conn
 
@@ -232,6 +266,355 @@ def listar_formatos_aprendidos():
         return rows
     except Exception:
         return []
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FASE D — Sistema de aprendizaje de conceptos NC
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Stopwords para extraccion de tokens significativos
+_STOP_NC = {
+    'de','la','el','en','a','y','con','por','para','del','un','una','los','las',
+    'al','se','su','que','no','es','pago','transferencia','nota','contable',
+    'banco','bancario','cobro','cargo','por','desde','hasta','entre','sin',
+    'mas','los','las','este','esta','fue','han','hay','bien','ser','tiene',
+    'son','sus','les','nos','fue','era','ese','esa'
+}
+
+import hashlib as _hashlib
+import unicodedata as _ud2
+
+def _norm_nc(s):
+    return _ud2.normalize('NFKD', (s or '').lower()).encode('ascii','ignore').decode()
+
+def _extraer_tokens_nc(texto):
+    """Extrae tokens significativos (3+ chars, sin stopwords) de un concepto NC."""
+    norm = _norm_nc(texto)
+    tokens = re.findall(r'[a-z0-9]{3,}', norm)
+    return sorted(set(t for t in tokens if t not in _STOP_NC))
+
+def _uuid_par_nc(banco_tokens, aux_tokens):
+    """UUID determinista del par banco<->auxiliar (MD5 de tokens ordenados)."""
+    key = '|'.join(sorted(banco_tokens)) + '::' + '|'.join(sorted(aux_tokens))
+    return _hashlib.md5(key.encode()).hexdigest()[:16]
+
+def _similitud_tokens_nc(t1, t2):
+    """Similitud Jaccard entre dos listas de tokens."""
+    s1, s2 = set(t1), set(t2)
+    if not s1 or not s2:
+        return 0.0
+    return len(s1 & s2) / len(s1 | s2)
+
+def buscar_en_catalogo_nc(banco_desc, aux_concepto, umbral=0.30):
+    """
+    Busca si el par banco<->NC tiene una regla aprobada.
+    Devuelve (uuid, similitud) o (None, 0.0).
+    """
+    try:
+        banco_tok = _extraer_tokens_nc(banco_desc)
+        aux_tok   = _extraer_tokens_nc(aux_concepto)
+        if len(banco_tok) < 1 or len(aux_tok) < 1:
+            return None, 0.0
+        conn  = _init_db()
+        rows  = conn.execute(
+            "SELECT uuid, banco_tokens, aux_tokens, confirmaciones FROM nc_catalogo "
+            "WHERE nivel IN ('ALTA','MEDIA') ORDER BY confirmaciones DESC LIMIT 200"
+        ).fetchall()
+        conn.close()
+        mejor_sim, mejor_uuid = 0.0, None
+        for uuid, bt_j, at_j, _ in rows:
+            bt = json.loads(bt_j or '[]')
+            at = json.loads(at_j or '[]')
+            sim = (_similitud_tokens_nc(banco_tok, bt) +
+                   _similitud_tokens_nc(aux_tok,   at)) / 2
+            if sim > mejor_sim and sim >= umbral:
+                mejor_sim, mejor_uuid = sim, uuid
+        return mejor_uuid, mejor_sim
+    except Exception:
+        return None, 0.0
+
+def _promover_candidatos_nc(min_veces=3):
+    """Promueve candidatos con suficientes confirmaciones al catalogo."""
+    try:
+        conn = _init_db()
+        candidatos = conn.execute(
+            "SELECT uuid, banco_desc_raw, aux_concepto_raw, banco_tokens, "
+            "aux_tokens, veces_visto, fecha_primera, fecha_ultima "
+            "FROM nc_aprendizaje WHERE veces_visto >= ?", (min_veces,)
+        ).fetchall()
+        n = 0
+        for uuid, bd, ac, bt, at, vv, fp, fu in candidatos:
+            nivel = 'ALTA' if vv >= 5 else 'MEDIA'
+            existe = conn.execute(
+                "SELECT id FROM nc_catalogo WHERE uuid=?", (uuid,)).fetchone()
+            if not existe:
+                conn.execute("""INSERT INTO nc_catalogo
+                    (uuid, banco_tokens, aux_tokens, confirmaciones, nivel,
+                     aprobado_por, fecha_primera, fecha_ultima, sync_status)
+                    VALUES (?,?,?,?,?,'AUTO',?,?,'PENDIENTE_SYNC')""",
+                    (uuid, bt, at, vv, nivel, fp, fu))
+                n += 1
+            conn.execute("DELETE FROM nc_aprendizaje WHERE uuid=?", (uuid,))
+        conn.commit(); conn.close()
+        return n
+    except Exception:
+        return 0
+
+def _aprender_match_nc(banco_desc, aux_doc, aux_concepto, metodo,
+                       valor_banco=None, valor_aux=None):
+    """
+    Registra un match NC confirmado y alimenta el aprendizaje.
+    Solo aprende si el documento es NC- (notas contables).
+    """
+    if not aux_doc or not str(aux_doc).upper().startswith('NC-'):
+        return
+    try:
+        banco_tok = _extraer_tokens_nc(banco_desc)
+        aux_tok   = _extraer_tokens_nc(aux_concepto)
+        if len(banco_tok) < 2 or len(aux_tok) < 2:
+            return
+        uuid  = _uuid_par_nc(banco_tok, aux_tok)
+        ahora = datetime.now().isoformat(timespec='seconds')
+        conn  = _init_db()
+        # Log historico
+        conn.execute("""INSERT INTO nc_historial_match
+            (fecha, banco_desc, aux_doc, aux_concepto, metodo, valor_banco, valor_aux)
+            VALUES (?,?,?,?,?,?,?)""",
+            (ahora, (banco_desc or '')[:200], aux_doc,
+             (aux_concepto or '')[:200], metodo, valor_banco, valor_aux))
+        # Actualizar catalogo si ya existe la regla
+        en_cat = conn.execute(
+            "SELECT id, confirmaciones FROM nc_catalogo WHERE uuid=?", (uuid,)).fetchone()
+        if en_cat:
+            nuevo_nivel = 'ALTA' if en_cat[1]+1 >= 5 else 'MEDIA'
+            conn.execute(
+                "UPDATE nc_catalogo SET confirmaciones=?, nivel=?, "
+                "fecha_ultima=?, sync_status='PENDIENTE_SYNC' WHERE uuid=?",
+                (en_cat[1]+1, nuevo_nivel, ahora, uuid))
+        else:
+            # Actualizar o insertar en aprendizaje
+            cand = conn.execute(
+                "SELECT id, veces_visto FROM nc_aprendizaje WHERE uuid=?", (uuid,)).fetchone()
+            if cand:
+                conn.execute(
+                    "UPDATE nc_aprendizaje SET veces_visto=?, fecha_ultima=? WHERE uuid=?",
+                    (cand[1]+1, ahora, uuid))
+            else:
+                conn.execute("""INSERT INTO nc_aprendizaje
+                    (uuid, banco_desc_raw, aux_concepto_raw, banco_tokens, aux_tokens,
+                     veces_visto, fecha_primera, fecha_ultima)
+                    VALUES (?,?,?,?,?,1,?,?)""",
+                    (uuid, (banco_desc or '')[:200], (aux_concepto or '')[:200],
+                     json.dumps(banco_tok), json.dumps(aux_tok), ahora, ahora))
+        conn.commit(); conn.close()
+        _promover_candidatos_nc()
+    except Exception:
+        pass
+
+# ── Sync bidireccional SQLite <-> Google Sheets ───────────────────────────────
+
+def _push_catalogo_to_sheets():
+    """Sube reglas PENDIENTE_SYNC del SQLite a Google Sheets."""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_json = st.secrets.get("GOOGLE_SHEETS_CREDS", None)
+        sheet_id   = st.secrets.get("GOOGLE_SHEET_ID",    None)
+        if not creds_json or not sheet_id:
+            return 0
+        creds = Credentials.from_service_account_info(
+            json.loads(creds_json),
+            scopes=["https://spreadsheets.google.com/feeds",
+                    "https://www.googleapis.com/auth/drive"])
+        gc = gspread.authorize(creds)
+        wb = gc.open_by_key(sheet_id)
+        try:
+            ws = wb.worksheet("nc_catalogo")
+        except Exception:
+            ws = wb.add_worksheet("nc_catalogo", rows=2000, cols=9)
+            ws.append_row(["uuid","banco_tokens","aux_tokens","confirmaciones",
+                           "nivel","aprobado_por","fecha_primera","fecha_ultima"])
+        conn = _init_db()
+        pendientes = conn.execute(
+            "SELECT uuid, banco_tokens, aux_tokens, confirmaciones, nivel, "
+            "aprobado_por, fecha_primera, fecha_ultima "
+            "FROM nc_catalogo WHERE sync_status='PENDIENTE_SYNC'"
+        ).fetchall()
+        existentes = {r[0] for r in ws.get_all_values()[1:] if r}
+        n = 0
+        for row in pendientes:
+            if row[0] not in existentes:
+                ws.append_row(list(row))
+                n += 1
+            conn.execute(
+                "UPDATE nc_catalogo SET sync_status='SINCRONIZADO' WHERE uuid=?",
+                (row[0],))
+        conn.commit(); conn.close()
+        return n
+    except Exception:
+        return 0
+
+def _pull_catalogo_from_sheets():
+    """Descarga reglas nuevas de Google Sheets al SQLite local."""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_json = st.secrets.get("GOOGLE_SHEETS_CREDS", None)
+        sheet_id   = st.secrets.get("GOOGLE_SHEET_ID",    None)
+        if not creds_json or not sheet_id:
+            return 0
+        creds = Credentials.from_service_account_info(
+            json.loads(creds_json),
+            scopes=["https://spreadsheets.google.com/feeds",
+                    "https://www.googleapis.com/auth/drive"])
+        gc = gspread.authorize(creds)
+        wb = gc.open_by_key(sheet_id)
+        try:
+            ws = wb.worksheet("nc_catalogo")
+        except Exception:
+            return 0
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            return 0
+        conn = _init_db()
+        n = 0
+        for row in rows[1:]:
+            if len(row) < 7 or not row[0]:
+                continue
+            uuid  = row[0]
+            conf  = int(row[3]) if str(row[3]).isdigit() else 1
+            nivel = row[4] or 'MEDIA'
+            existe = conn.execute(
+                "SELECT id, confirmaciones FROM nc_catalogo WHERE uuid=?", (uuid,)).fetchone()
+            if not existe:
+                conn.execute("""INSERT INTO nc_catalogo
+                    (uuid, banco_tokens, aux_tokens, confirmaciones, nivel,
+                     aprobado_por, fecha_primera, fecha_ultima, sync_status)
+                    VALUES (?,?,?,?,?,?,?,?,'SINCRONIZADO')""",
+                    (uuid, row[1], row[2], conf, nivel,
+                     row[5] if len(row)>5 else 'AUTO',
+                     row[6] if len(row)>6 else '',
+                     row[7] if len(row)>7 else ''))
+                n += 1
+            elif conf > existe[1]:
+                nuevo_nivel = 'ALTA' if conf >= 5 else 'MEDIA'
+                conn.execute(
+                    "UPDATE nc_catalogo SET confirmaciones=?, nivel=?, "
+                    "sync_status='SINCRONIZADO' WHERE uuid=?",
+                    (conf, nuevo_nivel, uuid))
+        conn.commit(); conn.close()
+        return n
+    except Exception:
+        return 0
+
+def sincronizar_catalogo_nc():
+    """Sincronizacion bidireccional: push local -> Sheets, pull Sheets -> local."""
+    if not OFFLINE_MODE:
+        return 0, 0
+    n_up   = _push_catalogo_to_sheets()
+    n_down = _pull_catalogo_from_sheets()
+    return n_up, n_down
+
+def listar_catalogo_nc(limite=8):
+    """Devuelve las reglas del catalogo ordenadas por confirmaciones."""
+    try:
+        if not os.path.exists(DB_PATH):
+            return [], 0
+        conn  = _init_db()
+        total = conn.execute("SELECT COUNT(*) FROM nc_catalogo").fetchone()[0]
+        rows  = conn.execute(
+            "SELECT uuid, banco_tokens, aux_tokens, confirmaciones, nivel, "
+            "aprobado_por, fecha_ultima "
+            "FROM nc_catalogo ORDER BY confirmaciones DESC LIMIT ?", (limite,)
+        ).fetchall()
+        pend  = conn.execute(
+            "SELECT COUNT(*) FROM nc_aprendizaje").fetchone()[0]
+        conn.close()
+        return rows, total, pend
+    except Exception:
+        return [], 0, 0
+
+def _aprender_match_nc_cloud(banco_desc, aux_doc, aux_concepto, metodo):
+    """
+    Para Streamlit Cloud: registra el aprendizaje NC directamente en Google Sheets
+    (tabla nc_aprendizaje del spreadsheet).
+    """
+    if not aux_doc or not str(aux_doc).upper().startswith('NC-'):
+        return
+    try:
+        banco_tok = _extraer_tokens_nc(banco_desc)
+        aux_tok   = _extraer_tokens_nc(aux_concepto)
+        if len(banco_tok) < 2 or len(aux_tok) < 2:
+            return
+        uuid  = _uuid_par_nc(banco_tok, aux_tok)
+        ahora = datetime.now().isoformat(timespec='seconds')
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_json = st.secrets.get("GOOGLE_SHEETS_CREDS", None)
+        sheet_id   = st.secrets.get("GOOGLE_SHEET_ID",    None)
+        if not creds_json or not sheet_id:
+            return
+        creds = Credentials.from_service_account_info(
+            json.loads(creds_json),
+            scopes=["https://spreadsheets.google.com/feeds",
+                    "https://www.googleapis.com/auth/drive"])
+        gc = gspread.authorize(creds)
+        wb = gc.open_by_key(sheet_id)
+        try:
+            ws = wb.worksheet("nc_aprendizaje")
+        except Exception:
+            ws = wb.add_worksheet("nc_aprendizaje", rows=2000, cols=8)
+            ws.append_row(["uuid","banco_desc_raw","aux_concepto_raw",
+                           "banco_tokens","aux_tokens","veces_visto",
+                           "fecha_primera","fecha_ultima"])
+        rows = ws.get_all_values()
+        uuid_map = {r[0]: i+2 for i,r in enumerate(rows[1:]) if r and r[0]}
+        if uuid in uuid_map:
+            row_n = uuid_map[uuid]
+            try:
+                vv = int(ws.cell(row_n, 6).value or 1)
+            except Exception:
+                vv = 1
+            ws.update_cell(row_n, 6, vv + 1)
+            ws.update_cell(row_n, 8, ahora)
+            # Si llega a 3 -> promover en nc_catalogo sheet
+            if vv + 1 >= 3:
+                _promover_cloud_to_catalogo(ws, row_n, uuid, banco_tok,
+                                            aux_tok, vv+1, wb)
+        else:
+            ws.append_row([uuid, (banco_desc or '')[:150],
+                           (aux_concepto or '')[:150],
+                           json.dumps(banco_tok), json.dumps(aux_tok),
+                           1, ahora, ahora])
+    except Exception:
+        pass
+
+def _promover_cloud_to_catalogo(ws_aprendizaje, row_n, uuid, banco_tok,
+                                  aux_tok, vv, wb):
+    """Promueve un candidato al nc_catalogo en Google Sheets."""
+    try:
+        try:
+            ws_cat = wb.worksheet("nc_catalogo")
+        except Exception:
+            ws_cat = wb.add_worksheet("nc_catalogo", rows=2000, cols=9)
+            ws_cat.append_row(["uuid","banco_tokens","aux_tokens","confirmaciones",
+                               "nivel","aprobado_por","fecha_primera","fecha_ultima"])
+        existentes = {r[0] for r in ws_cat.get_all_values()[1:] if r}
+        if uuid not in existentes:
+            ahora = datetime.now().isoformat(timespec='seconds')
+            nivel = 'ALTA' if vv >= 5 else 'MEDIA'
+            ws_cat.append_row([uuid, json.dumps(banco_tok), json.dumps(aux_tok),
+                               vv, nivel, 'AUTO', ahora, ahora])
+    except Exception:
+        pass
+
+def registrar_aprendizaje_nc(banco_desc, aux_doc, aux_concepto, metodo,
+                              valor_banco=None, valor_aux=None):
+    """Punto de entrada unificado: SQLite (offline) o Sheets (cloud)."""
+    if OFFLINE_MODE:
+        _aprender_match_nc(banco_desc, aux_doc, aux_concepto, metodo,
+                           valor_banco, valor_aux)
+    else:
+        _aprender_match_nc_cloud(banco_desc, aux_doc, aux_concepto, metodo)
 
 
 # ── Helpers originales ────────────────────────────────────────────────────────
@@ -1252,41 +1635,57 @@ def comparar_documentos(df_b, df_a):
                 lambda c: _score_concepto(desc_banco, c)
             )
 
-            # ── Score combinado (menor diff → mejor; más bonus/sim → mejor) ──
-            # Primero intentar match exacto por monto
+            # ── Fase D: bonus catalogo NC aprendido ───────────────────────────
+            def _cat_bonus(row):
+                if row.get('_PREFIJO','') != 'NC':
+                    return 0.0
+                _, sim = buscar_en_catalogo_nc(desc_banco, str(row.get('CONCEPTO','')))
+                return sim
+            candidatos['_cat_sim'] = candidatos.apply(_cat_bonus, axis=1)
+
+            # ── Score combinado ───────────────────────────────────────────────
             exactos = candidatos[candidatos['_diff'] <= TOL_EXACTA].copy()
             if not exactos.empty:
-                # Ordenar: primero los con doc_bonus, luego por similitud, luego por diff
                 exactos = exactos.sort_values(
-                    ['_doc_bonus', '_sim', '_diff'],
-                    ascending=[False, False, True]
+                    ['_doc_bonus', '_cat_sim', '_sim', '_diff'],
+                    ascending=[False, False, False, True]
                 )
                 mejor = exactos.iloc[0]
                 match_tipo    = 'EXACTO'
-                match_metodo  = 'DOC+MONTO' if mejor['_doc_bonus'] else 'MONTO'
-                match_monto   = mejor[col_buscar]
-                match_idx     = mejor.name
-                match_doc     = mejor['DOCUMENTO']
-                match_conc    = mejor['CONCEPTO']
+                if mejor['_doc_bonus']:
+                    match_metodo = 'DOC+MONTO'
+                elif mejor['_cat_sim'] >= 0.30:
+                    match_metodo = 'CATALOGO+MONTO'
+                else:
+                    match_metodo = 'MONTO'
+                match_monto     = mejor[col_buscar]
+                match_idx       = mejor.name
+                match_doc       = mejor['DOCUMENTO']
+                match_conc      = mejor['CONCEPTO']
                 match_fecha_aux = mejor['FECHA_RAW']
 
-            # ── Fallback: match aproximado ───────────────────────────────────
+            # ── Fallback: match aproximado ────────────────────────────────────
             if match_tipo is None and monto_abs > 0:
                 aprox = candidatos[
                     (candidatos['_diff'] / monto_abs) <= TOL_APROX
                 ].copy()
                 if not aprox.empty:
                     aprox = aprox.sort_values(
-                        ['_doc_bonus', '_sim', '_diff'],
-                        ascending=[False, False, True]
+                        ['_doc_bonus', '_cat_sim', '_sim', '_diff'],
+                        ascending=[False, False, False, True]
                     )
                     mejor = aprox.iloc[0]
                     match_tipo    = 'APROX'
-                    match_metodo  = 'DOC+APROX' if mejor['_doc_bonus'] else 'APROX'
-                    match_monto   = mejor[col_buscar]
-                    match_idx     = mejor.name
-                    match_doc     = mejor['DOCUMENTO']
-                    match_conc    = mejor['CONCEPTO']
+                    if mejor['_doc_bonus']:
+                        match_metodo = 'DOC+APROX'
+                    elif mejor['_cat_sim'] >= 0.30:
+                        match_metodo = 'CATALOGO+APROX'
+                    else:
+                        match_metodo = 'APROX'
+                    match_monto     = mejor[col_buscar]
+                    match_idx       = mejor.name
+                    match_doc       = mejor['DOCUMENTO']
+                    match_conc      = mejor['CONCEPTO']
                     match_fecha_aux = mejor['FECHA_RAW']
 
         if match_idx is not None:
@@ -1753,6 +2152,52 @@ with st.sidebar:
                     f" · {(_ultima or '')[:10]}</small>",
                     unsafe_allow_html=True
                 )
+        # ── Fase D5: catalogo NC aprendido ────────────────────────────────
+        try:
+            _cat_rows, _cat_total, _cat_pend = listar_catalogo_nc(5)
+        except Exception:
+            _cat_rows, _cat_total, _cat_pend = [], 0, 0
+        st.markdown("---")
+        st.markdown(
+            f"**📚 Catálogo NC** &nbsp;"
+            f"<span style='color:#42a5f5;font-size:.8rem;'>"
+            f"{_cat_total} reglas · {_cat_pend} pendientes</span>",
+            unsafe_allow_html=True
+        )
+        if _cat_rows:
+            for _cr in _cat_rows:
+                _uuid, _bt, _at, _conf, _nivel, _apr, _ult = _cr
+                _ico_nv = ("🟢" if _nivel=='ALTA'
+                           else "🟡" if _nivel=='MEDIA'
+                           else "⏳")
+                try:
+                    _bt_tok = json.loads(_bt or '[]')[:3]
+                    _at_tok = json.loads(_at or '[]')[:3]
+                    _lbl = ' '.join(_bt_tok) + ' ↔ ' + ' '.join(_at_tok)
+                except Exception:
+                    _lbl = _uuid
+                st.markdown(
+                    f"<small>{_ico_nv} {_lbl}<br>"
+                    f"&nbsp;&nbsp;{_conf} confirmaci{'o' if _conf==1 else 'o'}nes"
+                    f" · {(_ult or '')[:10]}</small>",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.markdown(
+                "<small style='opacity:.5;'>Aun sin reglas aprendidas.<br>"
+                "Se llenara automaticamente al procesar PDFs.</small>",
+                unsafe_allow_html=True
+            )
+        # ── Boton de sincronizacion ───────────────────────────────────────
+        st.markdown("")
+        if st.button("🔄 Sincronizar con Cloud", use_container_width=True,
+                     help="Sube reglas nuevas a Google Sheets y baja las del cloud"):
+            with st.spinner("Sincronizando..."):
+                _n_up, _n_down = sincronizar_catalogo_nc()
+            st.success(
+                f"✅ Sync OK — "
+                f"↑{_n_up} subidas · ↓{_n_down} bajadas"
+            )
         _hist = leer_historial_sqlite(6)
         if _hist:
             st.markdown("---")
@@ -1813,6 +2258,19 @@ if 'run' in st.session_state and st.session_state.run:
     if not df_aux.empty:
         df_comp, df_solo_aux = comparar_documentos(df_banco, df_aux)
         n_tot  = len(df_comp)
+        # ── Fase D3: auto-aprendizaje NC post-reconciliacion ─────────────────
+        if not df_comp.empty and 'DOC_AUXILIAR' in df_comp.columns:
+            _nc_matches = df_comp[
+                df_comp['DOC_AUXILIAR'].str.startswith('NC-', na=False)
+            ]
+            for _, _nr in _nc_matches.iterrows():
+                registrar_aprendizaje_nc(
+                    str(_nr.get('DESCRIPCION',   '') or ''),
+                    str(_nr.get('DOC_AUXILIAR',  '') or ''),
+                    str(_nr.get('CONCEPTO_AUX',  '') or ''),
+                    str(_nr.get('METODO_MATCH',  'MONTO') or 'MONTO'),
+                    _nr.get('VALOR_BANCO'), _nr.get('MONTO_AUXILIAR')
+                )
         n_exac = (df_comp['ESTADO'] == '✅ COINCIDE EXACTO').sum()
         n_apr  = (df_comp['ESTADO'] == '🔶 COINCIDE APROX.').sum()
         n_sbco = (df_comp['ESTADO'] == '❌ SOLO EN BANCO').sum()
