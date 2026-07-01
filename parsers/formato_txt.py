@@ -7,121 +7,300 @@ from datetime import datetime
 
 import pandas as pd
 
-from engine.columna import determinar_columna
-from storage.db import registrar_formato_pdf
-from parsers.banco_pdf import es_fecha_banco
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)
+# ── Patrones de fecha ──────────────────────────────────────────────────────────
+# Formato con separadores: 01/06/2025  01-06-2025  01.06.2025
+_RE_FECHA_SEP = re.compile(r'(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})')
+# Formato texto: 01 jun 2025 / 01 junio 2025
+_RE_FECHA_TXT = re.compile(
+    r'(\d{1,2})\s+(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic'
+    r'|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre'
+    r'|octubre|noviembre|diciembre)\s+(\d{2,4})', re.IGNORECASE)
+# Formato ISO: 2025-06-01
+_RE_FECHA_ISO = re.compile(r'(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})')
+# FIX: Formato compacto legado PRN: 01062025 (DDMMYYYY) o 20250601 (YYYYMMDD)
+_RE_FECHA_COMPACTA_DMY  = re.compile(r'\b(\d{2})(\d{2})(\d{4})\b')   # DDMMYYYY
+_RE_FECHA_COMPACTA_YMD  = re.compile(r'\b(\d{4})(\d{2})(\d{2})\b')   # YYYYMMDD
+
+_MESES = {
+    'ene': 1, 'feb': 2, 'mar': 3, 'abr': 4, 'may': 5, 'jun': 6,
+    'jul': 7, 'ago': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dic': 12,
+    'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4, 'mayo': 5,
+    'junio': 6, 'julio': 7, 'agosto': 8, 'septiembre': 9,
+    'octubre': 10, 'noviembre': 11, 'diciembre': 12,
+}
+
+_RE_VALOR = re.compile(r'[-+]?\$?\s*(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{0,2})?)')
 
 
-def limpiar_num(t):
-    from parsers.banco_pdf import limpiar_num as _ln
-    return _ln(t)
+def _parsear_fecha(s):
+    """Intenta parsear una fecha desde string, soportando múltiples formatos."""
+    if not s:
+        return None
+    s = s.strip()
 
-def parsear_banco_txt(texto):
-    registros = []
-    resumen = {}
-    # Detectar año en el texto (evita hardcoding)
-    _m_anio_t = re.search(r'\b(20\d{2})\b', texto or '')
-    anio_extracto = int(_m_anio_t.group(1)) if _m_anio_t else datetime.now().year
-    for linea in texto.split('\n'):
-        partes = linea.strip().split()
-        if not partes or not es_fecha_banco(partes[0]): continue
-        fecha_raw = partes[0]
-        nums = []; desc_p = []
-        for p in partes[1:]:
-            v = limpiar_num(p)
-            if v is not None: nums.append(v)
-            elif not nums: desc_p.append(p)
-        if not nums: continue
-        saldo = nums[-1]
-        valor = nums[-2] if len(nums) >= 2 else nums[0]
-        registros.append({
-            'FECHA_RAW': fecha_raw,
-            'FECHA': pd.to_datetime(f'{anio_extracto}/' + fecha_raw, format='%Y/%d/%m', errors='coerce'),
-            'DESCRIPCION': ' '.join(desc_p), 'VALOR': valor, 'SALDO': saldo,
-            'TIPO': 'ABONO' if (valor or 0) >= 0 else 'CARGO'
-        })
-    df = pd.DataFrame(registros)
-    if not df.empty:
-        df = df[df['VALOR'].notna()]
-        df['VALOR'] = pd.to_numeric(df['VALOR'], errors='coerce')
-        df = df.drop_duplicates()
-        df = df.sort_values('FECHA', na_position='last').reset_index(drop=True)
-        df.index += 1
-    resumen['TOTAL_ABONOS'] = df[df['VALOR'] > 0]['VALOR'].sum()
-    resumen['TOTAL_CARGOS'] = df[df['VALOR'] < 0]['VALOR'].sum()
-    resumen['SALDO_INICIAL'] = df.iloc[0]['SALDO'] if not df.empty else 0
-    resumen['SALDO_FINAL']   = df.iloc[-1]['SALDO'] if not df.empty else 0
-    return df, resumen
+    # ISO: 2025-06-01
+    m = _RE_FECHA_ISO.match(s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return datetime(y, mo, d)
+        except ValueError:
+            pass
 
-def parsear_auxiliar_txt(texto_completo):
-    meta = {}
-    registros = []
-    lineas = [l.strip() for l in texto_completo.split('\n') if l.strip()]
-    pending_doc = None
-    PAT_DOC = re.compile(r'^((?:CON|CE|CG|NC|RE|RG|FA|RI|REC|CXP|CXC|OC|NI|AJ|TF|EG|EI|NE|CT|ND|JR|CV|CM|TE|TC)-\d+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(.*)')
-    PAT_MONTO = re.compile(r'^([\d]{1,3}(?:,[\d]{3})*(?:\.[\d]{1,2})?)$')
-    PAT_MPFX  = re.compile(r'^([\d]{1,3}(?:,[\d]{3})*(?:\.[\d]{1,2})?)\s+((?:CON|CE|CG|NC|RE|RG|FA|RI|REC|CXP|CXC|OC|NI|AJ|TF|EG|EI|NE|CT|ND|JR|CV|CM|TE|TC)-\d+.*)$')
-    PAT_MSFX  = re.compile(r'\s([\d]{1,3}(?:,[\d]{3})*(?:\.[\d]{1,2})?)$')
-    def guardar(doc, fecha_s, concepto, monto_str):
-        monto = limpiar_num(monto_str.replace(',',''))
-        if not monto or monto <= 0: return
-        col = determinar_columna(concepto, doc)
-        debito = monto if col=='DEBITO' else None
-        credito = monto if col=='CREDITO' else None
-        try: fdt = pd.to_datetime(fecha_s, format='%d/%m/%Y', errors='coerce')
-        except: fdt = pd.NaT
-        registros.append({
-            'DOCUMENTO': doc, 'FECHA_RAW': fecha_s, 'FECHA': fdt,
-            'CONCEPTO': concepto, 'DEBITO': debito, 'CREDITO': credito,
-            'COLUMNA': col, 'VALOR_NETO': (debito or 0) - (credito or 0)
-        })
-    for linea in lineas:
-        m_pfx = PAT_MPFX.match(linea)
-        if m_pfx:
-            if pending_doc:
-                guardar(pending_doc['doc'], pending_doc['date'], pending_doc['concept'], m_pfx.group(1))
-                pending_doc = None
-            m_doc = PAT_DOC.match(m_pfx.group(2))
-            if m_doc:
-                doc_c, fecha_s, concepto_raw = m_doc.group(1), m_doc.group(2), m_doc.group(3)
-                m_end = PAT_MSFX.search(concepto_raw)
-                if m_end:
-                    guardar(doc_c, fecha_s, concepto_raw[:m_end.start()].strip(), m_end.group(1))
-                else:
-                    pending_doc = {'doc': doc_c, 'date': fecha_s, 'concept': concepto_raw}
-            continue
-        m_doc = PAT_DOC.match(linea)
-        if m_doc:
-            doc_c, fecha_s, concepto_raw = m_doc.group(1), m_doc.group(2), m_doc.group(3)
-            m_end = PAT_MSFX.search(concepto_raw)
-            if m_end:
-                guardar(doc_c, fecha_s, concepto_raw[:m_end.start()].strip(), m_end.group(1))
-            else:
-                pending_doc = {'doc': doc_c, 'date': fecha_s, 'concept': concepto_raw}
-            continue
-        if PAT_MONTO.match(linea) and pending_doc:
-            guardar(pending_doc['doc'], pending_doc['date'], pending_doc['concept'], linea)
-            pending_doc = None
-            continue
-        if pending_doc:
-            m_end = PAT_MSFX.search(linea)
-            if m_end:
-                try:
-                    if float(m_end.group(1).replace(',','')) > 100:
-                        guardar(pending_doc['doc'], pending_doc['date'], pending_doc['concept'], m_end.group(1))
-                        pending_doc = None
-                except: pass
-    df = pd.DataFrame(registros)
-    df = df.drop_duplicates()
-    df = df.sort_values('FECHA', na_position='last').reset_index(drop=True)
-    df.index += 1
-    meta['TOTAL_DEBITOS'] = df['DEBITO'].sum() if not df.empty else 0
-    meta['TOTAL_CREDITOS'] = df['CREDITO'].sum() if not df.empty else 0
+    # Con separadores: 01/06/2025
+    m = _RE_FECHA_SEP.match(s)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        if mo > 12:
+            d, mo = mo, d
+        try:
+            return datetime(y, mo, d)
+        except ValueError:
+            pass
+
+    # Texto: 01 jun 2025
+    m = _RE_FECHA_TXT.match(s)
+    if m:
+        d = int(m.group(1))
+        mo = _MESES.get(m.group(2).lower(), 0)
+        y = int(m.group(3))
+        if y < 100:
+            y += 2000
+        try:
+            return datetime(y, mo, d)
+        except ValueError:
+            pass
+
+    # FIX compacto DDMMYYYY: 01062025
+    m = _RE_FECHA_COMPACTA_DMY.match(s)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12 and 2000 <= y <= 2100:
+            try:
+                return datetime(y, mo, d)
+            except ValueError:
+                pass
+
+    # FIX compacto YYYYMMDD: 20250601
+    m = _RE_FECHA_COMPACTA_YMD.match(s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            try:
+                return datetime(y, mo, d)
+            except ValueError:
+                pass
+
+    return None
+
+
+def _buscar_fecha_en_linea(linea):
+    """Busca fecha en una línea, probando todos los patrones en orden de prioridad."""
+    # ISO primero (más específico)
+    m = _RE_FECHA_ISO.search(linea)
+    if m:
+        f = _parsear_fecha(m.group(0))
+        if f:
+            return f, m.end()
+
+    # Con separadores
+    m = _RE_FECHA_SEP.search(linea)
+    if m:
+        f = _parsear_fecha(m.group(0))
+        if f:
+            return f, m.end()
+
+    # Texto
+    m = _RE_FECHA_TXT.search(linea)
+    if m:
+        f = _parsear_fecha(m.group(0))
+        if f:
+            return f, m.end()
+
+    # Compacto YYYYMMDD
+    m = _RE_FECHA_COMPACTA_YMD.search(linea)
+    if m:
+        f = _parsear_fecha(m.group(0))
+        if f:
+            return f, m.end()
+
+    # Compacto DDMMYYYY (FIX PRN legado)
+    m = _RE_FECHA_COMPACTA_DMY.search(linea)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12 and 2000 <= y <= 2100:
+            try:
+                f = datetime(y, mo, d)
+                return f, m.end()
+            except ValueError:
+                pass
+
+    return None, 0
+
+
+def _limpiar_valor(s):
+    """Convierte string de valor colombiano a float."""
+    s = str(s).strip().replace('$', '').replace(' ', '')
+    neg = s.startswith('-') or s.startswith('(')
+    s = s.lstrip('-()+')
+    if ',' in s and '.' in s:
+        if s.rindex(',') > s.rindex('.'):
+            s = s.replace('.', '').replace(',', '.')
+        else:
+            s = s.replace(',', '')
+    elif ',' in s:
+        s = s.replace(',', '.')
     try:
-        registrar_formato_pdf('', 'AUXILIAR', list(df.columns), 'txt', [],
-                              banco_detectado='auxiliar_txt')
+        v = float(s)
+        return -v if neg else v
     except Exception:
-        pass
-    # Saldos no disponibles en TXT generalment
+        return 0.0
+
+
+def _detectar_columnas(lineas):
+    """Detecta el separador y estructura de columnas del archivo."""
+    for sep in [';', '\t', '|', ',']:
+        for linea in lineas[:10]:
+            if sep in linea and linea.count(sep) >= 2:
+                return sep
+    return None  # columnas fijas
+
+
+def parsear_txt(file_bytes, tipo='auxiliar', encoding='utf-8'):
+    """
+    Parser principal para archivos TXT/PRN de auxiliares contables y extractos.
+    Soporta:
+      - Columnas delimitadas (;  |  TAB  ,)
+      - Columnas fijas (ancho fijo)
+      - Formato compacto PRN legado (DDMMYYYY sin separador)
+    Retorna DataFrame con columnas FECHA, DESCRIPCION, DEBITO, CREDITO, VALOR, ORIGEN
+    """
+    try:
+        texto = file_bytes.decode(encoding, errors='replace')
+    except Exception:
+        texto = file_bytes.decode('latin-1', errors='replace')
+
+    lineas = [l.rstrip() for l in texto.splitlines() if l.strip()]
+    if not lineas:
+        return pd.DataFrame(columns=['FECHA', 'DESCRIPCION', 'DEBITO', 'CREDITO', 'VALOR', 'ORIGEN'])
+
+    sep = _detectar_columnas(lineas)
+    movs = []
+
+    if sep:
+        # ── Formato delimitado ─────────────────────────────────────────────────
+        encabezado = None
+        for linea in lineas:
+            cols = [c.strip() for c in linea.split(sep)]
+            if encabezado is None:
+                # Detectar si es línea de encabezado
+                muestra = ' '.join(cols).upper()
+                if any(k in muestra for k in ['FECHA', 'DATE', 'DATA', 'DIA']):
+                    encabezado = [c.upper() for c in cols]
+                    continue
+                else:
+                    # Primera línea sin encabezado: intentar parsear directamente
+                    encabezado = []
+
+            if not cols or len(cols) < 2:
+                continue
+
+            # Buscar fecha en columnas
+            fecha = None
+            desc = ''
+            debito = credito = 0.0
+
+            for i, col in enumerate(cols):
+                if fecha is None:
+                    f, _ = _buscar_fecha_en_linea(col)
+                    if f:
+                        fecha = f
+                        continue
+                vals = _RE_VALOR.findall(col)
+                if vals and not desc:
+                    # Primera columna no-fecha con texto largo → descripción
+                    if len(col) > 5 and not vals:
+                        desc = col[:120]
+
+            if fecha is None:
+                continue
+
+            # Extraer descripción y valores numéricos
+            nums = []
+            for col in cols:
+                vv = _RE_VALOR.findall(col)
+                if vv:
+                    nums.extend([_limpiar_valor(v) for v in vv if _limpiar_valor(v) != 0])
+                elif len(col) > 4 and not _RE_FECHA_SEP.search(col) and not _RE_FECHA_ISO.search(col):
+                    if not desc:
+                        desc = col[:120]
+
+            if len(nums) >= 2:
+                debito, credito = nums[0], nums[1]
+            elif len(nums) == 1:
+                v = nums[0]
+                if v > 0:
+                    credito = v
+                else:
+                    debito = abs(v)
+
+            valor = credito - debito if credito or debito else (nums[0] if nums else 0)
+
+            movs.append({
+                'FECHA': fecha,
+                'DESCRIPCION': desc.strip()[:120],
+                'DEBITO': debito,
+                'CREDITO': credito,
+                'VALOR': valor,
+                'ORIGEN': 'txt'
+            })
+
+    else:
+        # ── Columnas fijas / PRN legado ────────────────────────────────────────
+        for linea in lineas:
+            if len(linea) < 8:
+                continue
+
+            fecha, pos = _buscar_fecha_en_linea(linea)
+            if not fecha:
+                continue
+
+            resto = linea[pos:].strip()
+            nums = [_limpiar_valor(v) for v in _RE_VALOR.findall(resto) if _limpiar_valor(v) != 0]
+            # Descripción: texto no numérico después de la fecha
+            desc_match = re.sub(r'[\d.,\-\+\$\(\)]+', ' ', resto).strip()
+            desc = ' '.join(desc_match.split())[:120]
+
+            debito = credito = 0.0
+            if len(nums) >= 2:
+                debito, credito = abs(nums[0]), abs(nums[1])
+            elif len(nums) == 1:
+                v = nums[0]
+                if v < 0:
+                    debito = abs(v)
+                else:
+                    credito = v
+
+            valor = credito - debito
+
+            movs.append({
+                'FECHA': fecha,
+                'DESCRIPCION': desc,
+                'DEBITO': debito,
+                'CREDITO': credito,
+                'VALOR': valor,
+                'ORIGEN': 'txt_prn'
+            })
+
+    if not movs:
+        return pd.DataFrame(columns=['FECHA', 'DESCRIPCION', 'DEBITO', 'CREDITO', 'VALOR', 'ORIGEN'])
+
+    df = pd.DataFrame(movs)
+    df['FECHA'] = pd.to_datetime(df['FECHA'], errors='coerce')
+    for col in ['DEBITO', 'CREDITO', 'VALOR']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    return df.dropna(subset=['FECHA']).sort_values('FECHA').reset_index(drop=True)
