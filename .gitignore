@@ -1,4 +1,44 @@
-*
-!app.py
-!requirements.txt
-!.gitignore
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Databases
+*.db
+*.sqlite3
+
+# Secrets
+secrets.toml
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temp
+*.tmp
+_fix*.py
+_push*.py
+_SUBIR*.bat
+_REPARAR*.bat
+_ABRIR*.bat
